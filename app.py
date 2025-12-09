@@ -1,28 +1,41 @@
 from flask import Flask, request, jsonify
+import base64
 import cv2
 import numpy as np
-import base64
 
 app = Flask(__name__)
 
-@app.route("/process", methods=["POST"])
+@app.route("/p", methods=["POST"])
 def process():
-    data = request.json
-    img_b64 = data["image"]
-    img_data = base64.b64decode(img_b64)
-    npimg = np.frombuffer(img_data, np.uint8)
-    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+    try:
+        data = request.get_json()
 
-    if img is None:
-        return jsonify({"error": "Invalid image"}), 400
+        if not data or "image" not in data:
+            return jsonify({"error": "missing 'image' in JSON body"}), 400
 
-    h, w = img.shape[:2]
+        # Decode base64 → bytes
+        img_bytes = base64.b64decode(data["image"])
 
-    return jsonify({
-        "status": "ok",
-        "width": w,
-        "height": h
-    })
+        # Bytes → numpy array
+        img_array = np.frombuffer(img_bytes, np.uint8)
+
+        # Decode to OpenCV image
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+        if img is None:
+            return jsonify({"error": "Failed to decode image"}), 400
+
+        # SUCCESS RESPONSE
+        return jsonify({
+            "status": "ok",
+            "shape": img.shape,
+            "message": "Image received and decoded successfully."
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=10000)
+
