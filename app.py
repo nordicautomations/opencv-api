@@ -5,13 +5,14 @@ import numpy as np
 
 app = Flask(__name__)
 
+@app.route("/process", methods=["POST"])
 @app.route("/p", methods=["POST"])
 def process():
     try:
         data = request.get_json()
 
         if not data or "image" not in data:
-            return jsonify({"error": "missing 'image' in JSON body"}), 400
+            return jsonify({"error": "missing 'image' field"}), 400
 
         # Decode base64 → bytes
         img_bytes = base64.b64decode(data["image"])
@@ -25,11 +26,11 @@ def process():
         if img is None:
             return jsonify({"error": "Failed to decode image"}), 400
 
-        # SUCCESS RESPONSE
+        # SUCCESS
         return jsonify({
             "status": "ok",
             "shape": img.shape,
-            "message": "Image received and decoded successfully."
+            "message": "Image received and decoded successfully"
         })
 
     except Exception as e:
@@ -37,5 +38,4 @@ def process():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-
+    app.run(host="0.0.0.0", port=8080)
