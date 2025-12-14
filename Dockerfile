@@ -1,26 +1,21 @@
 FROM python:3.10-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV OMP_NUM_THREADS=1
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     poppler-utils \
     tesseract-ocr \
-    libtiff5-dev \
-    libjpeg62-turbo-dev \
-    libpng-dev \
-    libfreetype6-dev \
-    liblcms2-dev \
-    libwebp-dev \
-    libopenjp2-7-dev \
+    tesseract-ocr-eng \
+    libgl1 \
     libsm6 \
     libxext6 \
     libxrender1 \
-    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir numpy==1.24.4
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
