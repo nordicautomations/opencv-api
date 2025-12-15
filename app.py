@@ -1,4 +1,4 @@
-import io, base64, math, re
+import io, base64, math
 from flask import Flask, request, jsonify
 import numpy as np
 import cv2
@@ -6,7 +6,6 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
 from shapely.geometry import Polygon, Point
-from shapely.ops import unary_union
 
 app = Flask(__name__)
 
@@ -43,12 +42,12 @@ def extract_text_boxes(cv_img, min_conf=40):
         conf = int(data["conf"][i]) if data["conf"][i].isdigit() else -1
         if conf < min_conf or not txt:
             continue
-        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        x,y,w,h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
         boxes.append({
             "text": txt,
-            "confidence": round(conf / 100.0, 2),
-            "bbox": [x, y, w, h],
-            "centroid": [x + w // 2, y + h // 2]
+            "confidence": conf / 100.0,
+            "bbox": [x,y,w,h],
+            "centroid": [x + w//2, y + h//2]
         })
     return boxes
 
@@ -75,15 +74,14 @@ def detect_walls(cv_img):
     edges = cv2.Canny(gray, 50, 150)
     dil = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT,(5,5)), 2)
     lines = cv2.HoughLinesP(dil, 1, math.pi/180, 120, minLineLength=60, maxLineGap=25)
-    line_mask = np.zeros_like(gray)
+    mask = np.zeros_like(gray)
     if lines is not None:
         for x1,y1,x2,y2 in lines.reshape(-1,4):
-            cv2.line(line_mask, (x1,y1), (x2,y2), 255, 8)
-    combined = cv2.bitwise_or(dil, line_mask)
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE,
+            cv2.line(mask, (x1,y1), (x2,y2), 255, 8)
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
                               cv2.getStructuringElement(cv2.MORPH_RECT,(15,15)), 2)
     _, wall_mask = cv2.threshold(closed, 50, 255, cv2.THRESH_BINARY)
-    return wall_mask
+    return wall_mask, lines
 
 def extract_rooms(wall_mask, min_area_px=2500):
     inv = cv2.bitwise_not(wall_mask)
@@ -96,10 +94,48 @@ def extract_rooms(wall_mask, min_area_px=2500):
         eps = 0.007 * cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, eps, True)
         poly = approx.reshape(-1,2).tolist()
-        if len(poly) < 3:
-            continue
-        rooms.append(poly)
+        if len(poly) >= 3:
+            rooms.append(poly)
     return rooms
+
+# -------------------------
+# Calibration from dimensions
+# -------------------------
+
+def line_length(line):
+    x1,y1,x2,y2 = line
+    return math.hypot(x2-x1, y2-y1)
+
+def calibrate_px_per_meter(lines, dimensions):
+    if lines is None or not dimensions:
+        return None
+
+    pxpm_values = []
+
+    for d in dimensions:
+        mm = d["value_mm"]
+        orientation = d["orientation"]
+
+        candidates = []
+        for x1,y1,x2,y2 in lines.reshape(-1,4):
+            dx, dy = abs(x2-x1), abs(y2-y1)
+            if orientation == "horizontal" and dx > dy*5:
+                candidates.append((x1,y1,x2,y2))
+            if orientation == "vertical" and dy > dx*5:
+                candidates.append((x1,y1,x2,y2))
+
+        if not candidates:
+            continue
+
+        longest = max(candidates, key=line_length)
+        px_len = line_length(longest)
+        meters = mm / 1000.0
+        pxpm_values.append(px_len / meters)
+
+    if not pxpm_values:
+        return None
+
+    return float(np.median(pxpm_values))
 
 # -------------------------
 # Room naming (NIVÅ 3)
@@ -107,35 +143,22 @@ def extract_rooms(wall_mask, min_area_px=2500):
 
 def assign_room_name(room_poly, text_boxes):
     poly = Polygon(room_poly)
-    candidates = []
-    for t in text_boxes:
-        if poly.contains(Point(t["centroid"])):
-            candidates.append(t)
-    if not candidates:
+    hits = [t for t in text_boxes if poly.contains(Point(t["centroid"]))]
+    if not hits:
         return {"value":"Ukjent","source":"none","confidence":0.0}
-    best = max(candidates, key=lambda x: x["confidence"])
-    return {
-        "value": best["text"],
-        "source": "ocr",
-        "confidence": best["confidence"]
-    }
+    best = max(hits, key=lambda x: x["confidence"])
+    return {"value":best["text"],"source":"ocr","confidence":best["confidence"]}
 
 # -------------------------
 # API
 # -------------------------
 
-@app.route("/health")
-def health():
-    return jsonify({"status":"ok"})
-
 @app.route("/process", methods=["POST"])
 def process():
     data = request.get_json(force=True)
-    if "image" not in data:
-        return jsonify({"error":"missing image"}), 400
-
-    pxpm = float(data["px_per_meter"]) if "px_per_meter" in data else None
     images = b64_to_images(data["image"])
+    dimensions = data.get("dimensions", [])
+
     results = []
 
     for page, img in enumerate(images, start=1):
@@ -143,7 +166,12 @@ def process():
 
         text_boxes = extract_text_boxes(cv_img)
         img_no_text = mask_text_regions(cv_img, text_boxes)
-        walls = detect_walls(img_no_text)
+        walls, lines = detect_walls(img_no_text)
+
+        pxpm = data.get("px_per_meter")
+        if not pxpm:
+            pxpm = calibrate_px_per_meter(lines, dimensions)
+
         rooms = extract_rooms(walls)
 
         for i, poly in enumerate(rooms):
@@ -154,14 +182,15 @@ def process():
             results.append({
                 "page": page,
                 "room_id": f"P{page}_R{i+1}",
-                "area_m2": area_m2,
                 "area_px": round(area_px,2),
+                "area_m2": area_m2,
                 "name": name,
                 "polygon_px": poly
             })
 
     return jsonify({
         "status":"ok",
+        "px_per_meter": pxpm,
         "rooms_detected": len(results),
         "rooms": results
     })
