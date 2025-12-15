@@ -1,7 +1,7 @@
-numpy==1.24.4
-opencv-python-headless==4.8.1.78
 flask==2.3.2
-pdf2image==1.16.0
+opencv-python-headless==4.8.1.78
+numpy==1.24.4
 pillow==10.0.0
+pdf2image==1.16.0
 pytesseract==0.3.10
-Shapely==2.0.1
+shapely==2.0.1
