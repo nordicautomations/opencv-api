@@ -5,3 +5,5 @@ pillow==10.0.0
 pdf2image==1.16.0
 pytesseract==0.3.10
 shapely==2.0.1
+pandas==2.0.3
+openpyxl==3.1.2
