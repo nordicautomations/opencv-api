@@ -7,8 +7,6 @@ from collections import defaultdict
 import pytesseract
 import pandas as pd
 from datetime import datetime
-import tempfile
-import os
 
 app = Flask(__name__)
 
@@ -126,125 +124,151 @@ def find_building_dimensions(img, orientation="horizontal"):
     return longest_length, clustered_lines[:5]
 
 # -------------------------
-# Room Detection & Analysis
+# IMPROVED Room Detection
 # -------------------------
 
-def detect_rooms(img, min_area_px=5000, max_area_px=None):
+def detect_rooms(img, min_area_px=2000, max_area_px=None):
     """
-    Detect individual rooms using contour detection
-    Returns list of room contours with bounding boxes
+    IMPROVED: More aggressive room detection with multiple strategies
     """
     binary, _ = preprocess_floorplan(img)
     
-    # Invert so rooms are white
+    # Strategy 1: Standard inversion
     inverted = cv2.bitwise_not(binary)
     
-    # Close small gaps in walls
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(inverted, cv2.MORPH_CLOSE, kernel, iterations=3)
+    # Strategy 2: Less aggressive closing to preserve smaller rooms
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(inverted, cv2.MORPH_CLOSE, kernel_small, iterations=2)
     
-    # Find contours
+    # Find contours with hierarchy
     contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     
     if max_area_px is None:
-        max_area_px = img.shape[0] * img.shape[1] * 0.8  # 80% of image
+        max_area_px = img.shape[0] * img.shape[1] * 0.8
     
     rooms = []
+    
+    # RELAXED filtering
     for i, contour in enumerate(contours):
         area = cv2.contourArea(contour)
         
-        # Filter by area and ensure it's not a hole (hierarchy check)
+        # Lower threshold, broader range
         if min_area_px < area < max_area_px:
-            # Check if it's an outer contour (not a hole)
-            if hierarchy[0][i][3] == -1 or hierarchy[0][i][2] != -1:
-                x, y, w, h = cv2.boundingRect(contour)
-                
-                # Additional shape validation (not too thin/elongated)
-                aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
-                if aspect_ratio < 10:  # Not a corridor or line
-                    rooms.append({
-                        'contour': contour,
-                        'area_px': area,
-                        'bbox': (x, y, w, h),
-                        'center': (x + w//2, y + h//2)
-                    })
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # More lenient aspect ratio (allow corridors)
+            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+            
+            # Allow up to 15:1 ratio (corridors/hallways)
+            if aspect_ratio < 15 and w > 20 and h > 20:
+                rooms.append({
+                    'contour': contour,
+                    'area_px': area,
+                    'bbox': (x, y, w, h),
+                    'center': (x + w//2, y + h//2)
+                })
     
-    # Sort by area (largest first)
+    # Sort by area
     rooms.sort(key=lambda x: x['area_px'], reverse=True)
+    
+    print(f"DEBUG: Found {len(rooms)} rooms with min_area_px={min_area_px}")
     
     return rooms
 
 def extract_text_from_region(img, bbox, padding=10):
     """
-    Extract text from a specific region using Tesseract OCR
+    IMPROVED: Safer OCR with fallback
     """
-    x, y, w, h = bbox
+    try:
+        x, y, w, h = bbox
+        
+        # Add padding safely
+        x = max(0, x - padding)
+        y = max(0, y - padding)
+        w = min(img.shape[1] - x, w + 2*padding)
+        h = min(img.shape[0] - y, h + 2*padding)
+        
+        # Extract region
+        roi = img[y:y+h, x:x+w]
+        
+        if roi.size == 0:
+            return ""
+        
+        # Preprocess
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # OCR with fallback (try without Norwegian first)
+        try:
+            text = pytesseract.image_to_string(thresh, config='--oem 3 --psm 6')
+        except:
+            text = ""
+        
+        # Clean
+        text = text.strip().replace('|', '').replace('_', ' ')
+        text = ' '.join(text.split())
+        
+        return text if len(text) > 1 else ""
     
-    # Add padding
-    x = max(0, x - padding)
-    y = max(0, y - padding)
-    w = min(img.shape[1] - x, w + 2*padding)
-    h = min(img.shape[0] - y, h + 2*padding)
-    
-    # Extract region
-    roi = img[y:y+h, x:x+w]
-    
-    # Preprocess for better OCR
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
-    
-    # Increase contrast
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(gray)
-    
-    # Threshold
-    _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # OCR with Norwegian language support
-    custom_config = r'--oem 3 --psm 6 -l nor+eng'
-    text = pytesseract.image_to_string(thresh, config=custom_config)
-    
-    # Clean up text
-    text = text.strip()
-    text = ' '.join(text.split())  # Remove extra whitespace
-    
-    return text if text else "Unknown"
+    except Exception as e:
+        print(f"OCR Error: {e}")
+        return ""
 
 def assign_room_names(img, rooms):
     """
-    Extract room names/labels from detected room regions
+    IMPROVED: Better fallback naming
     """
-    for room in rooms:
+    # Common Norwegian room types
+    room_keywords = {
+        'bad': 'Bad',
+        'wc': 'WC',
+        'sov': 'Soverom',
+        'stue': 'Stue',
+        'kjøkken': 'Kjøkken',
+        'gang': 'Gang',
+        'entre': 'Entré',
+        'bod': 'Bod'
+    }
+    
+    for idx, room in enumerate(rooms):
         x, y, w, h = room['bbox']
         
-        # Try to extract text from the room center
+        # Try OCR
         text = extract_text_from_region(img, room['bbox'], padding=20)
         
-        # Clean and validate room name
         if text and len(text) > 1:
-            # Remove common noise patterns
-            text = text.replace('|', '').replace('_', ' ')
-            room['name'] = text[:50]  # Limit length
+            # Check for known room types
+            text_lower = text.lower()
+            for keyword, full_name in room_keywords.items():
+                if keyword in text_lower:
+                    room['name'] = full_name
+                    break
+            else:
+                room['name'] = text[:50]
         else:
-            room['name'] = f"Rom {rooms.index(room) + 1}"
+            # Smart fallback based on size/position
+            area_m2 = room.get('area_m2', 0)
+            
+            if area_m2 > 15:
+                room['name'] = f"Stort rom {idx + 1}"
+            elif area_m2 < 3:
+                room['name'] = f"Lite rom/bod {idx + 1}"
+            else:
+                room['name'] = f"Rom {idx + 1}"
     
     return rooms
 
 def calculate_room_areas(rooms, px_per_mm):
-    """
-    Calculate room areas in square meters
-    """
+    """Calculate room areas in square meters"""
     for room in rooms:
         area_px = room['area_px']
-        
-        # Convert pixels to mm²
         area_mm2 = area_px / (px_per_mm ** 2)
-        
-        # Convert to m²
         area_m2 = area_mm2 / 1_000_000
         
         room['area_m2'] = round(area_m2, 2)
         
-        # Also calculate dimensions
         _, _, w_px, h_px = room['bbox']
         room['width_m'] = round((w_px / px_per_mm) / 1000, 2)
         room['height_m'] = round((h_px / px_per_mm) / 1000, 2)
@@ -252,10 +276,7 @@ def calculate_room_areas(rooms, px_per_mm):
     return rooms
 
 def create_excel_report(rooms, scale_info, metadata=None):
-    """
-    Create Excel file with room data
-    """
-    # Prepare data for DataFrame
+    """Create Excel file with room data"""
     data = []
     for i, room in enumerate(rooms, 1):
         data.append({
@@ -271,13 +292,10 @@ def create_excel_report(rooms, scale_info, metadata=None):
     
     df = pd.DataFrame(data)
     
-    # Create Excel file with multiple sheets
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Main data sheet
         df.to_excel(writer, sheet_name='Romanalyse', index=False)
         
-        # Summary sheet
         summary_data = {
             'Metrikk': [
                 'Totalt antall rom',
@@ -303,7 +321,6 @@ def create_excel_report(rooms, scale_info, metadata=None):
         summary_df = pd.DataFrame(summary_data)
         summary_df.to_excel(writer, sheet_name='Sammendrag', index=False)
         
-        # Auto-adjust column widths
         for sheet_name in writer.sheets:
             worksheet = writer.sheets[sheet_name]
             for column in worksheet.columns:
@@ -384,8 +401,7 @@ def process():
 @app.route("/analyze_rooms", methods=["POST"])
 def analyze_rooms():
     """
-    Complete room analysis endpoint
-    Returns room data as JSON
+    IMPROVED: More lenient room detection
     """
     try:
         data = request.get_json(force=True)
@@ -409,17 +425,25 @@ def analyze_rooms():
         
         px_per_mm = ((horiz_px / horiz_mm) + (vert_px / vert_mm)) / 2
         
-        # Detect rooms
-        min_area = data.get("min_room_area_m2", 2.0)  # Default 2 m²
+        # IMPROVED: Much lower minimum area threshold
+        min_area = data.get("min_room_area_m2", 0.5)  # Default 0.5 m²
         min_area_px = min_area * 1_000_000 * (px_per_mm ** 2)
+        
+        print(f"DEBUG: min_area_m2={min_area}, min_area_px={min_area_px}, px_per_mm={px_per_mm}")
         
         rooms = detect_rooms(img, min_area_px=min_area_px)
         
         if not rooms:
             return jsonify({
+                "status": "error",
                 "error": "No rooms detected",
-                "suggestion": "Try adjusting min_room_area_m2 parameter"
-            }), 400
+                "debug": {
+                    "min_area_px": int(min_area_px),
+                    "min_area_m2": min_area,
+                    "px_per_mm": round(px_per_mm, 4),
+                    "suggestion": "Try lowering min_room_area_m2 to 0.3 or check if image is valid floorplan"
+                }
+            }), 200  # Return 200 so n8n can read the debug info
         
         # Extract room names
         rooms = assign_room_names(img, rooms)
@@ -451,17 +475,16 @@ def analyze_rooms():
         })
     
     except Exception as e:
+        import traceback
         return jsonify({
             "error": "Analysis failed",
-            "message": str(e)
+            "message": str(e),
+            "traceback": traceback.format_exc()
         }), 500
 
 @app.route("/analyze_rooms_excel", methods=["POST"])
 def analyze_rooms_excel():
-    """
-    Complete room analysis with Excel export
-    Returns Excel file
-    """
+    """Excel export endpoint"""
     try:
         data = request.get_json(force=True)
         
@@ -475,7 +498,6 @@ def analyze_rooms_excel():
         if not horiz_mm or not vert_mm:
             return jsonify({"error": "Invalid dimensions_summary"}), 400
         
-        # Calculate scale
         horiz_px, _ = find_building_dimensions(img, "horizontal")
         vert_px, _ = find_building_dimensions(img, "vertical")
         
@@ -484,8 +506,7 @@ def analyze_rooms_excel():
         
         px_per_mm = ((horiz_px / horiz_mm) + (vert_px / vert_mm)) / 2
         
-        # Detect rooms
-        min_area = data.get("min_room_area_m2", 2.0)
+        min_area = data.get("min_room_area_m2", 0.5)
         min_area_px = min_area * 1_000_000 * (px_per_mm ** 2)
         
         rooms = detect_rooms(img, min_area_px=min_area_px)
@@ -496,15 +517,12 @@ def analyze_rooms_excel():
         rooms = assign_room_names(img, rooms)
         rooms = calculate_room_areas(rooms, px_per_mm)
         
-        # Create Excel file
         scale_info = {
             'px_per_mm': round(px_per_mm, 4),
             'px_per_meter': round(px_per_mm * 1000, 2)
         }
         
         excel_file = create_excel_report(rooms, scale_info)
-        
-        # Generate filename with timestamp
         filename = f"romanalyse_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         
         return send_file(
@@ -525,6 +543,7 @@ def health():
     return jsonify({
         "status": "healthy", 
         "service": "opencv-floorplan-processor",
+        "version": "2.0-improved",
         "endpoints": ["/process", "/analyze_rooms", "/analyze_rooms_excel"]
     })
 
