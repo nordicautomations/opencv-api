@@ -127,51 +127,130 @@ def find_building_dimensions(img, orientation="horizontal"):
 # IMPROVED Room Detection
 # -------------------------
 
+def detect_walls_only(img):
+    """
+    Extract ONLY wall lines, remove furniture/text/details
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Aggressive blur to remove thin furniture lines
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Adaptive threshold to get walls
+    binary = cv2.adaptiveThreshold(
+        blurred, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        blockSize=21,  # Larger block = only thick lines (walls)
+        C=10
+    )
+    
+    # Morphology to connect broken walls and remove furniture
+    kernel_thick = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    
+    # Dilate to connect wall segments
+    walls = cv2.dilate(binary, kernel_thick, iterations=2)
+    
+    # Erode to remove thin furniture lines
+    walls = cv2.erode(walls, kernel_thick, iterations=1)
+    
+    # Close gaps in walls
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    walls = cv2.morphologyEx(walls, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+    
+    return walls
+
+def is_likely_furniture(contour, img_shape):
+    """
+    Detect if a contour is likely furniture/fixture vs a room
+    """
+    area = cv2.contourArea(contour)
+    x, y, w, h = cv2.boundingRect(contour)
+    
+    # Calculate contour properties
+    perimeter = cv2.arcLength(contour, True)
+    
+    # Compactness: rooms are more rectangular, furniture more varied
+    if perimeter > 0:
+        compactness = 4 * math.pi * area / (perimeter ** 2)
+    else:
+        compactness = 0
+    
+    # Furniture indicators:
+    # 1. Very circular (compactness close to 1) = table
+    if compactness > 0.85:
+        return True
+    
+    # 2. Very small compared to image
+    img_area = img_shape[0] * img_shape[1]
+    if area < img_area * 0.001:  # Less than 0.1% of image
+        return True
+    
+    # 3. Extreme aspect ratios (thin strips = furniture edges)
+    aspect = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+    if aspect > 20:  # Very elongated
+        return True
+    
+    # 4. Too square and small (icons/symbols)
+    if 0.8 < aspect < 1.2 and area < img_area * 0.005:
+        return True
+    
+    return False
+
 def detect_rooms(img, min_area_px=2000, max_area_px=None):
     """
-    IMPROVED: More aggressive room detection with multiple strategies
+    ADVANCED: Wall-based room detection, filters out furniture
     """
-    binary, _ = preprocess_floorplan(img)
+    # Step 1: Extract only walls
+    walls = detect_walls_only(img)
     
-    # Strategy 1: Standard inversion
-    inverted = cv2.bitwise_not(binary)
+    # Step 2: Invert so rooms are white
+    inverted = cv2.bitwise_not(walls)
     
-    # Strategy 2: Less aggressive closing to preserve smaller rooms
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    closed = cv2.morphologyEx(inverted, cv2.MORPH_CLOSE, kernel_small, iterations=2)
+    # Step 3: Fill any remaining holes in walls
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    filled = cv2.morphologyEx(inverted, cv2.MORPH_CLOSE, kernel, iterations=2)
     
-    # Find contours with hierarchy
-    contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    # Step 4: Find contours
+    contours, hierarchy = cv2.findContours(filled, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     
     if max_area_px is None:
         max_area_px = img.shape[0] * img.shape[1] * 0.8
     
     rooms = []
+    furniture_filtered = 0
     
-    # RELAXED filtering
     for i, contour in enumerate(contours):
         area = cv2.contourArea(contour)
         
-        # Lower threshold, broader range
-        if min_area_px < area < max_area_px:
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # More lenient aspect ratio (allow corridors)
-            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
-            
-            # Allow up to 15:1 ratio (corridors/hallways)
-            if aspect_ratio < 15 and w > 20 and h > 20:
-                rooms.append({
-                    'contour': contour,
-                    'area_px': area,
-                    'bbox': (x, y, w, h),
-                    'center': (x + w//2, y + h//2)
-                })
+        # Basic area filter
+        if not (min_area_px < area < max_area_px):
+            continue
+        
+        # Check if it's furniture
+        if is_likely_furniture(contour, img.shape):
+            furniture_filtered += 1
+            continue
+        
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Additional validation
+        aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+        
+        # Rooms can be corridors (up to 15:1) but must have minimum width
+        min_dimension = min(w, h)
+        if aspect_ratio < 15 and min_dimension > 10:  # At least 10px wide
+            rooms.append({
+                'contour': contour,
+                'area_px': area,
+                'bbox': (x, y, w, h),
+                'center': (x + w//2, y + h//2)
+            })
     
     # Sort by area
     rooms.sort(key=lambda x: x['area_px'], reverse=True)
     
-    print(f"DEBUG: Found {len(rooms)} rooms with min_area_px={min_area_px}")
+    print(f"DEBUG: Found {len(rooms)} rooms (filtered {furniture_filtered} furniture items)")
     
     return rooms
 
@@ -218,45 +297,23 @@ def extract_text_from_region(img, bbox, padding=10):
 
 def assign_room_names(img, rooms):
     """
-    IMPROVED: Better fallback naming
+    Extract room names via OCR - NO GUESSING
+    If no name found, mark as "Unidentified"
     """
-    # Common Norwegian room types
-    room_keywords = {
-        'bad': 'Bad',
-        'wc': 'WC',
-        'sov': 'Soverom',
-        'stue': 'Stue',
-        'kjøkken': 'Kjøkken',
-        'gang': 'Gang',
-        'entre': 'Entré',
-        'bod': 'Bod'
-    }
-    
     for idx, room in enumerate(rooms):
         x, y, w, h = room['bbox']
         
         # Try OCR
         text = extract_text_from_region(img, room['bbox'], padding=20)
         
+        # Only use text if we actually found something meaningful
         if text and len(text) > 1:
-            # Check for known room types
-            text_lower = text.lower()
-            for keyword, full_name in room_keywords.items():
-                if keyword in text_lower:
-                    room['name'] = full_name
-                    break
-            else:
-                room['name'] = text[:50]
+            # Clean up text
+            cleaned = text.strip()[:50]
+            room['name'] = cleaned
         else:
-            # Smart fallback based on size/position
-            area_m2 = room.get('area_m2', 0)
-            
-            if area_m2 > 15:
-                room['name'] = f"Stort rom {idx + 1}"
-            elif area_m2 < 3:
-                room['name'] = f"Lite rom/bod {idx + 1}"
-            else:
-                room['name'] = f"Rom {idx + 1}"
+            # NO GUESSING - mark as unidentified
+            room['name'] = "Unidentified"
     
     return rooms
 
